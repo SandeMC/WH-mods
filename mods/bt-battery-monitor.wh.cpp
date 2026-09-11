@@ -179,6 +179,7 @@ static std::atomic<int> g_warningThreshold{30};
 // Tray icon cache to avoid redundant NIM_MODIFY calls
 static WCHAR g_lastTip[128] = {};
 static HICON g_lastIcon = NULL;
+static bool g_trayVisible = false;
 
 // Dashboard GUI thread
 static HANDLE g_guiThread = nullptr;
@@ -688,7 +689,12 @@ static void RefreshConnectedState(std::vector<DeviceInfo>& devices) {
     BLUETOOTH_FIND_RADIO_PARAMS params = {sizeof(params)};
     HANDLE hRadio;
     HBLUETOOTH_RADIO_FIND hFind = BluetoothFindFirstRadio(&params, &hRadio);
-    if (!hFind) return;
+    if (!hFind) {
+        for (auto& dev : devices) {
+            dev.connected = false;
+        }
+        return;
+    }
 
     do {
         for (auto& dev : devices) {
@@ -857,6 +863,19 @@ static void UpdateTrayIcon() {
         }
     }
 
+    if (devCount == 0) {
+        if (g_trayVisible) {
+            NOTIFYICONDATAW nid = {sizeof(nid)};
+            nid.guidItem = GUID_BTBAT_TRAY;
+            nid.uFlags = NIF_GUID;
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            g_trayVisible = false;
+            g_lastIcon = NULL;
+            g_lastTip[0] = L'\0';
+        }
+        return;
+    }
+
     NOTIFYICONDATAW nid = {sizeof(nid)};
     nid.guidItem = GUID_BTBAT_TRAY;
     nid.uFlags = NIF_ICON | NIF_TIP | NIF_GUID | NIF_SHOWTIP;
@@ -865,8 +884,6 @@ static void UpdateTrayIcon() {
     if (lowest >= 0 && lowest < threshold) {
         bool flashState = (GetTickCount64() / 1000) % 2 == 0;
         nid.hIcon = flashState ? g_hIconLowBatRed : g_hIconLowBatBlack;
-    } else if (devCount == 0) {
-        nid.hIcon = g_hIconDisconnected;
     } else if (devCount == 1) {
         switch (singleType) {
             case DEVICE_KEYBOARD: nid.hIcon = g_hIconKeyboard; break;
@@ -879,9 +896,7 @@ static void UpdateTrayIcon() {
         nid.hIcon = g_hIconMulti;
     }
 
-    if (devCount == 0) {
-        lstrcpynW(nid.szTip, L"No connected devices", ARRAYSIZE(nid.szTip));
-    } else if (devCount == 1) {
+    if (devCount == 1) {
         for (const auto& d : currentDevices) {
             if (d.connected) {
                 if (d.batteryPercent >= 0)
@@ -898,7 +913,20 @@ static void UpdateTrayIcon() {
             StringCchPrintfW(nid.szTip, ARRAYSIZE(nid.szTip), L"%d devices", devCount);
     }
 
-    if (wcscmp(nid.szTip, g_lastTip) != 0 || nid.hIcon != g_lastIcon) {
+    if (!g_trayVisible) {
+        nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_GUID | NIF_SHOWTIP;
+        nid.hWnd = hwnd;
+        nid.uCallbackMessage = WM_TRAY_CALLBACK;
+        if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            Shell_NotifyIconW(NIM_ADD, &nid);
+        }
+        nid.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        g_trayVisible = true;
+        lstrcpynW(g_lastTip, nid.szTip, ARRAYSIZE(g_lastTip));
+        g_lastIcon = nid.hIcon;
+    } else if (wcscmp(nid.szTip, g_lastTip) != 0 || nid.hIcon != g_lastIcon) {
         lstrcpynW(g_lastTip, nid.szTip, ARRAYSIZE(g_lastTip));
         g_lastIcon = nid.hIcon;
         Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -1018,20 +1046,10 @@ static void ShowPopupMenu() {
 // Message handler for the hidden tray window — receives TaskbarCreated, timer, device change events
 static LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_taskbarCreatedMsg != 0 && msg == g_taskbarCreatedMsg) {
-        NOTIFYICONDATAW nid = {sizeof(nid)};
-        nid.guidItem = GUID_BTBAT_TRAY;
-        nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_GUID | NIF_SHOWTIP;
-        nid.hWnd = hWnd;
-        nid.uCallbackMessage = WM_TRAY_CALLBACK;
-        nid.hIcon = g_hIconDisconnected ? g_hIconDisconnected : g_hIconMulti;
-        lstrcpynW(nid.szTip, L"BT Battery Monitor", ARRAYSIZE(nid.szTip));
-        if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
-            Shell_NotifyIconW(NIM_DELETE, &nid);
-            Shell_NotifyIconW(NIM_ADD, &nid);
-        }
-        nid.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &nid);
-        PostMessageW(hWnd, WM_UPDATE_DEVICES, 0, 0);
+        g_trayVisible = false;
+        g_lastIcon = NULL;
+        g_lastTip[0] = L'\0';
+        UpdateTrayIcon();
         return 0;
     }
 
@@ -1069,10 +1087,13 @@ static LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
         case WM_DESTROY: {
             KillTimer(hWnd, 1);
-            NOTIFYICONDATAW nid = {sizeof(nid)};
-            nid.guidItem = GUID_BTBAT_TRAY;
-            nid.uFlags = NIF_GUID;
-            Shell_NotifyIconW(NIM_DELETE, &nid);
+            if (g_trayVisible) {
+                NOTIFYICONDATAW nid = {sizeof(nid)};
+                nid.guidItem = GUID_BTBAT_TRAY;
+                nid.uFlags = NIF_GUID;
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+                g_trayVisible = false;
+            }
             PostQuitMessage(0);
             return 0;
         }
@@ -1795,20 +1816,6 @@ static unsigned int __stdcall TrayThreadProc(void*) {
 
     g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
-    NOTIFYICONDATAW nid = {sizeof(nid)};
-    nid.guidItem = GUID_BTBAT_TRAY;
-    nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_GUID | NIF_SHOWTIP;
-    nid.hWnd = hWnd;
-    nid.uCallbackMessage = WM_TRAY_CALLBACK;
-    nid.hIcon = g_hIconDisconnected ? g_hIconDisconnected : g_hIconMulti;
-    lstrcpynW(nid.szTip, L"BT Battery Monitor", ARRAYSIZE(nid.szTip));
-    if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
-        Shell_NotifyIconW(NIM_DELETE, &nid);
-        Shell_NotifyIconW(NIM_ADD, &nid);
-    }
-    nid.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconW(NIM_SETVERSION, &nid);
-
     DEV_BROADCAST_DEVICEINTERFACE_W filter = { sizeof(filter) };
     filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
     
@@ -1962,9 +1969,7 @@ void WhTool_ModUninit() {
         (PVOID*)&g_guiThread, NULL, g_guiThread);
     if (hGuiThread) {
         HWND dh = (HWND)InterlockedExchangePointer((PVOID*)&g_dashboardHwnd, nullptr);
-        if (dh && IsWindow(dh)) {
-            PostMessageW(dh, WM_CLOSE, 0, 0);
-        }
+        if (dh && IsWindow(dh)) { PostMessageW(dh, WM_CLOSE, 0, 0); }
         DWORD wr = WaitForSingleObject(hGuiThread, 3000);
         if (wr == WAIT_TIMEOUT) {
             Wh_Log(L"GUI thread did not exit within 3 s — leaking handle to avoid race");
